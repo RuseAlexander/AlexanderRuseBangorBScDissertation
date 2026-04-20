@@ -1,0 +1,433 @@
+---
+title: "finalscript2"
+output: html_document
+---
+
+```{r}
+#Clip raw rasters to europe.
+library(terra)
+
+raw_dir  <- "E:/ERA5_Fire/raw"
+clip_dir <- "E:/ERA5_Fire/raw_clipped"
+dir.create(clip_dir, recursive = TRUE, showWarnings = FALSE)
+
+bbox <- ext(-15, 25, 30, 65)
+
+years  <- 1989:1990
+months <- 1:12
+
+for (yr in years) {
+  for (m in months) {
+
+    pattern <- sprintf("_%d_%02d\\.nc$", yr, m)
+    files_to_clip <- list.files(file.path(raw_dir, yr), pattern = pattern, full.names = TRUE)
+
+    if (length(files_to_clip) == 0) next
+
+    for (f in files_to_clip) {
+
+      out_f <- file.path(clip_dir, basename(f))
+      if (file.exists(out_f)) next
+
+      message("Clipping: ", basename(f))
+
+      r <- rast(f)
+      r_clipped <- crop(rotate(r), bbox)
+
+      writeCDF(r_clipped, out_f, overwrite = TRUE, compression = NA)
+
+      rm(r, r_clipped)
+      gc()
+    }
+  }
+}
+
+message("Script 1 Complete: All files clipped.")
+```
+
+
+```{r}
+#Process clipped rasters into the correct units and derive relative humidity using manus fomrula.
+library(terra)
+
+clip_dir <- "E:/ERA5_Fire/raw_clipped"
+proc_dir <- "E:/ERA5_Fire/processed2"
+dir.create(proc_dir, recursive = TRUE, showWarnings = FALSE)
+
+years  <- 1989:1990
+months <- 1:12
+
+for (yr in years) {
+  for (m in months) {
+
+    check_f <- file.path(proc_dir, sprintf("Wind_%d_%02d.nc", yr, m))
+    if (file.exists(check_f)) {
+      message(sprintf("Skipping %d-%02d: Already processed.", yr, m))
+      next
+    }
+
+    message(sprintf("Processing %d-%02d...", yr, m))
+
+    t_file <- file.path(clip_dir, sprintf("2m_temperature_%d_%02d.nc", yr, m))
+    d_file <- file.path(clip_dir, sprintf("2m_dewpoint_temperature_%d_%02d.nc", yr, m))
+    u_file <- file.path(clip_dir, sprintf("10m_u_component_of_wind_%d_%02d.nc", yr, m))
+    v_file <- file.path(clip_dir, sprintf("10m_v_component_of_wind_%d_%02d.nc", yr, m))
+    p_file <- file.path(clip_dir, sprintf("hourly_total_precip_%d_%02d.nc", yr, m))
+
+    if (!all(file.exists(t_file, d_file, u_file, v_file, p_file))) next
+
+    t_r <- rast(t_file) - 273.15
+    d_r <- rast(d_file) - 273.15
+    u_r <- rast(u_file)
+    v_r <- rast(v_file)
+    p_r <- rast(p_file) * 1000
+
+    rh_r <- 100 * (exp((17.625 * d_r)/(243.04 + d_r)) / exp((17.625 * t_r)/(243.04 + t_r)))
+    ws_r <- sqrt(u_r^2 + v_r^2) * 3.6
+
+    n_days <- nlyr(t_r)
+    p_daily_list <- vector("list", n_days)
+
+    for (d in seq_len(n_days)) {
+
+      idx_noon <- ((d - 1) * 24) + 13
+
+      if (d == 1) {
+
+        prev_date <- as.Date(paste(yr, m, 1, sep = "-")) - 1
+        p_prev_f <- file.path(
+          clip_dir,
+          sprintf("hourly_total_precip_%s_%s.nc",
+                  format(prev_date, "%Y"),
+                  format(prev_date, "%m"))
+        )
+
+        if (yr == 1989 && m == 1) {
+          p_daily_list[[d]] <- sum(p_r[[1:13]])
+        } else if (file.exists(p_prev_f)) {
+          p_prev_r <- rast(p_prev_f) * 1000
+          p_tail <- p_prev_r[[(nlyr(p_prev_r) - 10):nlyr(p_prev_r)]]
+          p_daily_list[[d]] <- sum(c(p_tail, p_r[[1:13]]))
+        } else {
+          p_daily_list[[d]] <- sum(p_r[[1:13]])
+        }
+
+      } else {
+        p_daily_list[[d]] <- sum(p_r[[(idx_noon - 23):idx_noon]])
+      }
+    }
+
+    p_month_r <- rast(p_daily_list)
+
+    writeCDF(t_r,       file.path(proc_dir, sprintf("Tmean_%d_%02d.nc", yr, m)), overwrite = TRUE)
+    writeCDF(rh_r,      file.path(proc_dir, sprintf("RH_%d_%02d.nc", yr, m)), overwrite = TRUE)
+    writeCDF(ws_r,      file.path(proc_dir, sprintf("Wind_%d_%02d.nc", yr, m)), overwrite = TRUE)
+    writeCDF(p_month_r, file.path(proc_dir, sprintf("Tot_Precip_%d_%02d.nc", yr, m)), overwrite = TRUE)
+
+    rm(t_r, d_r, u_r, v_r, p_r, rh_r, ws_r, p_month_r)
+    gc()
+  }
+}
+
+message("Script 2 Complete")
+```
+
+
+```{r}
+#Apply land-mask and calculate fwi using fwiraster().
+
+library(terra)
+library(cffdrs)
+library(sf)
+library(rnaturalearth)
+
+proc_dir <- "E:/ERA5_Fire/processed2"
+fwi_dir  <- "E:/ERA5_Fire/fwi2"
+dir.create(fwi_dir, recursive = TRUE, showWarnings = FALSE)
+
+years  <- 1989:2025
+months <- 1:12
+
+land <- ne_countries(scale = "medium", returnclass = "sf")
+land_vect <- vect(st_transform(land, 4326))
+
+ffmc_prev <- NULL
+dmc_prev  <- NULL
+dc_prev   <- NULL
+
+for (yr in years) {
+  for (m in months) {
+
+    t_f <- file.path(proc_dir, sprintf("Tmean_%d_%02d.nc", yr, m))
+    if (!file.exists(t_f)) next
+
+    t_stack  <- rast(t_f)
+    rh_stack <- rast(file.path(proc_dir, sprintf("RH_%d_%02d.nc", yr, m)))
+    ws_stack <- rast(file.path(proc_dir, sprintf("Wind_%d_%02d.nc", yr, m)))
+    p_stack  <- rast(file.path(proc_dir, sprintf("Tot_Precip_%d_%02d.nc", yr, m)))
+
+    land_mask <- rasterize(land_vect, t_stack[[1]], field = 1)
+
+    n_days <- nlyr(t_stack)
+
+    for (d in seq_len(n_days)) {
+
+      out_f <- file.path(fwi_dir, sprintf("FWI_%d_%02d_%02d.nc", yr, m, d))
+      if (file.exists(out_f)) next
+
+      message("Processing: ", basename(out_f))
+
+      t_r  <- mask(t_stack[[d]],  land_mask)
+      rh_r <- mask(rh_stack[[d]], land_mask)
+      ws_r <- mask(ws_stack[[d]], land_mask)
+      p_r  <- mask(p_stack[[d]],  land_mask)
+
+      fw_day <- c(t_r, rh_r, ws_r, p_r)
+      names(fw_day) <- c("temp", "rh", "ws", "prec")
+
+      if (is.null(ffmc_prev)) {
+        ffmc_prev <- t_r; values(ffmc_prev) <- 85
+        dmc_prev  <- t_r; values(dmc_prev)  <- 6
+        dc_prev   <- t_r; values(dc_prev)   <- 15
+      }
+
+      init_stack <- c(ffmc_prev, dmc_prev, dc_prev)
+      names(init_stack) <- c("ffmc", "dmc", "dc")
+
+      fwi_day_res <- fwiRaster(
+        input = fw_day,
+        init  = init_stack,
+        mon   = m,
+        out   = "all"
+      )
+
+      writeCDF(fwi_day_res, out_f, overwrite = TRUE)
+
+      ffmc_prev <- fwi_day_res[["ffmc"]]
+      dmc_prev  <- fwi_day_res[["dmc"]]
+      dc_prev   <- fwi_day_res[["dc"]]
+    }
+
+    rm(t_stack, rh_stack, ws_stack, p_stack, land_mask)
+    gc()
+  }
+}
+
+message("Script 3 Complete: FWI calculated.")
+```
+
+
+```{r}
+#Calculate area-weighted mean per region per day.
+
+library(terra)
+library(data.table)
+library(pbapply)
+library(exactextractr)
+library(sf)
+library(raster)
+
+fwi_dir   <- "E:/ERA5_Fire/fwi2"
+gpkg_path <- "E:/ERA5_Fire/polygons_raw/merge4326.shp"
+out_csv   <- "E:/ERA5_Fire/wholeregion_stats_all_layers10426weighted.csv"
+
+fwi_files <- list.files(fwi_dir, pattern = "\\.nc$", full.names = TRUE)
+
+p_sf <- st_read(gpkg_path, quiet = TRUE)
+sample_r <- rast(fwi_files[1])
+
+p_sf <- st_transform(p_sf, st_crs(sample_r))
+
+cat("==========================================\n")
+cat("Total Regions Ready:", nrow(p_sf), "\n")
+head(p_sf)
+cat("Alignment confirmed. Starting extraction...\n")
+cat("==========================================\n")
+
+results_list <- pblapply(fwi_files, function(f) {
+
+  r_terra <- rast(f)
+  v_names <- c("temp", "rh", "ws", "prec", "ffmc", "dmc", "dc", "isi", "bui", "fwi", "dsr")
+  names(r_terra) <- v_names
+
+  r_stack <- stack(r_terra)
+
+  ext_vals <- exact_extract(r_stack, p_sf, "mean", progress = FALSE)
+
+  res_dt <- as.data.table(ext_vals)
+  setnames(res_dt, old = names(res_dt), new = paste0(v_names, "_mean"))
+
+  res_dt[, region := p_sf$name_merge]
+  res_dt[, date := as.IDate(gsub("^FWI_|\\.nc$", "", basename(f)), format = "%Y_%m_%d")]
+
+  res_dt
+})
+
+final_data <- rbindlist(results_list)
+fwrite(final_data, out_csv)
+
+message("Daily means calculated.")
+```
+
+
+```{r}
+#Filter out 1989, trend analysis.
+
+library(data.table)
+library(dplyr)
+library(Kendall)
+library(trend)
+library(modifiedmk)
+
+df <- fread("E:/ERA5_Fire/wholeregion_stats_all_layers10426weighted.csv")
+df[, date := as.IDate(date)]
+df <- df[year(date) > 1989]
+
+annual_climate <- df %>%
+  group_by(region, year = year(date)) %>%
+  summarise(
+    mean_temp = mean(temp_mean, na.rm = TRUE),
+    mean_rh   = mean(rh_mean, na.rm = TRUE),
+    mean_wind = mean(ws_mean, na.rm = TRUE),
+    total_precip = sum(prec_mean, na.rm = TRUE),
+    mean_fwi  = mean(fwi_mean, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+run_climate_trend <- function(data, var_name) {
+
+  message("Processing: ", var_name)
+
+  data %>%
+    group_by(region) %>%
+    arrange(year) %>%
+    summarise(
+      mk_p  = tryCatch(MannKendall(na.omit(.data[[var_name]]))$sl[1], error = function(e) NA),
+      sen_s = tryCatch(sens.slope(na.omit(.data[[var_name]]))$estimates, error = function(e) NA),
+      sen_p = tryCatch(sens.slope(na.omit(.data[[var_name]]))$p.value, error = function(e) NA),
+      mod_p = tryCatch(mmkh(na.omit(.data[[var_name]]))$"new P.value", error = function(e) NA),
+      .groups = "drop"
+    ) %>%
+    rename_with(~paste0(var_name, "_", .), -region)
+}
+
+vars <- c("mean_temp", "mean_rh", "mean_wind", "total_precip", "mean_fwi")
+
+climate_results <- lapply(vars, run_climate_trend, data = annual_climate)
+
+final_climate_table <- Reduce(function(x, y) {
+  left_join(x, y, by = "region")
+}, climate_results)
+
+fwrite(final_climate_table, "E:/ERA5_Fire/Table_Part1_Climate_Trendsweighted.csv")
+```
+
+
+```{r}
+#Trend analysis of FWI, classified by days at each danger level.
+
+danger_levels <- c("Low", "Moderate", "High", "VeryHigh", "Extreme")
+
+annual_danger <- df %>%
+  mutate(
+    year = year(date),
+    class = factor(case_when(
+      fwi_mean < 4.54  ~ "Low",
+      fwi_mean < 9.38  ~ "Moderate",
+      fwi_mean < 17.35 ~ "High",
+      fwi_mean < 52.36 ~ "VeryHigh",
+      TRUE ~ "Extreme"
+    ), levels = danger_levels)
+  ) %>%
+  group_by(region, year, class) %>%
+  summarise(days = n(), .groups = "drop") %>%
+  tidyr::complete(region, year, class, fill = list(days = 0)) %>%
+  tidyr::pivot_wider(names_from = class, values_from = days) %>%
+  mutate(Severe_Total = High + VeryHigh + Extreme)
+
+inventory <- annual_danger %>%
+  group_by(region) %>%
+  summarise(across(all_of(c(danger_levels, "Severe_Total")), sum, .names = "total_days_{.col}"))
+
+danger_vars <- c(danger_levels, "Severe_Total")
+
+danger_results <- lapply(danger_vars, run_climate_trend, data = annual_danger)
+
+final_danger_table <- Reduce(function(x, y) {
+  left_join(x, y, by = "region")
+}, danger_results) %>%
+  left_join(inventory, by = "region")
+
+fwrite(final_danger_table, "E:/ERA5_Fire/Table_Part2_Danger_Trendsweighted.csv")
+```
+
+
+```{r}
+#Join output table of script 5 and 6
+
+library(data.table)
+library(dplyr)
+library(sf)
+
+climate_tab <- fread("E:/ERA5_Fire/Table_Part1_Climate_Trendsweighted.csv")
+danger_tab  <- fread("E:/ERA5_Fire/Table_Part2_Danger_Trendsweighted.csv")
+
+mega_table <- left_join(climate_tab, danger_tab, by = "region")
+
+p <- st_read("E:/ERA5_Fire/polygons_raw/merge4326.shp", quiet = TRUE)
+
+wales_names  <- p$name_merge[!is.na(p$CTYUA23NMW)]
+france_names <- p$name_merge[!is.na(p$code_insee)]
+
+mega_table <- mega_table %>%
+  mutate(
+    region_type = case_when(
+      region %in% wales_names  ~ "Wales",
+      region %in% france_names ~ "France",
+      TRUE ~ "Rest_of_GB"
+    )
+  ) %>%
+  select(region, region_type, everything())
+
+fwrite(mega_table, "E:/ERA5_Fire/MEGA_Regional_Trends_10426weighted.csv")
+
+cat("Table saved.")
+```
+
+
+```{r}
+#Work out Mahalanobis distance of each county to Gwynedd.
+
+library(data.table)
+library(dplyr)
+
+df <- fread("E:/ERA5_Fire/wholeregion_stats_all_layers10426weighted.csv")
+df[, date := as.IDate(date)]
+df <- df[year(date) > 1989]
+
+metrics <- df %>%
+  group_by(region) %>%
+  summarise(
+    fwi_m   = mean(fwi_mean, na.rm = TRUE),
+    fwi_p95 = quantile(fwi_mean, 0.95, na.rm = TRUE),
+    dmc_m   = mean(dmc_mean, na.rm = TRUE),
+    dc_m    = mean(dc_mean, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  na.omit()
+
+X <- scale(metrics[, -1])
+rownames(X) <- metrics$region
+covm <- cov(X)
+
+if (!"Gwynedd" %in% rownames(X)) stop("Gwynedd missing from data!")
+
+target <- X["Gwynedd", ]
+
+metrics$maha_dist <- sqrt(mahalanobis(X, center = target, cov = covm))
+
+fwrite(metrics, "E:/ERA5_Fire/Mahalanobis_Results_10426weighted.csv")
+
+message("Mahalanobis results saved.")
+```
+
